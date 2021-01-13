@@ -36,5 +36,5 @@ if [ 1 -eq 1 ]; then
     # launch usb camera dirver in ROS
     # roslaunch usb_cam usb_cam-test.launch
     # detect it 
-    roslaunch yolov3_pytorch_ros detector_from_camera.launch classes_name:="coco_cn.names" class_names_cn:=True  
+    CUDA_VISIBLE_DEVICES="1" roslaunch yolov3_pytorch_ros detector_from_camera.launch classes_name:="coco_cn.names" class_names_cn:=True  
 fi 
