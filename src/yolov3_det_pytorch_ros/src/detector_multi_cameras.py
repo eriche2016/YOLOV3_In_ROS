@@ -1,0 +1,531 @@
+#!/usr/bin/env python
+# -*- coding:utf-8 -*-
+
+
+from __future__ import division
+
+# Python imports
+import numpy as np
+import scipy.io as sio
+import os, sys, time
+from skimage.transform import resize
+
+# to avoid confilits with Image in sensor_msgs
+from PIL import Image as PILImage
+from PIL import ImageDraw, ImageFont
+
+# ROS imports
+import rospy
+import std_msgs.msg
+from rospkg import RosPack
+from std_msgs.msg import UInt8
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import Polygon, Point32
+from yolov3_pytorch_ros.msg import BoundingBox, BoundingBoxes
+# CV related
+# here it uses conda cv2
+# here it uses conda cv_bridge
+ros_cv2_path = '/opt/ros/kinetic/lib/python2.7/dist-packages'
+if ros_cv2_path in sys.path:
+    sys.path.remove(ros_cv2_path)
+import cv2
+import pdb
+# pdb.set_trace()
+
+from cv_bridge import CvBridge, CvBridgeError
+
+package = RosPack()
+package_path = package.get_path('yolov3_pytorch_ros')
+
+# Deep learning imports
+import torch
+from torch.utils.data import DataLoader
+from torchvision import datasets
+from torch.autograd import Variable
+
+from models import *
+from utils.utils import *
+
+# Detector manager class for YOLO
+class DetectorManager():
+    def __init__(self):
+        # Load weights parameter
+        # by default set it to yolov3.weights
+        weights_name = rospy.get_param('~weights_name', 'yolov3.weights')
+        self.weights_path = os.path.join(package_path, 'models', weights_name)
+        rospy.loginfo("Found weights, loading %s", self.weights_path)
+
+        # Raise error if it cannot find the model
+        if not os.path.isfile(self.weights_path):
+            raise IOError(('{:s} not found.').format(self.weights_path))
+
+        # Load image parameter and confidence threshold
+        self.front_image_topic = rospy.get_param('~front_image_topic', '/camera/rgb/image_raw')
+        self.back_image_topic = rospy.get_param('~back_image_topic', '/camera1/usb_cam1/image_raw')
+        self.right_image_topic = rospy.get_param('~right_image_topic', '/camera2/usb_cam2/image_raw')
+        self.confidence_th = rospy.get_param('~confidence', 0.7)
+        self.class_names_cn = rospy.get_param('~class_names_cn', False)
+        if self.class_names_cn:
+            # set the font path for mandering output in classn names
+            self.font_path = os.path.join(package_path, 'fonts', "simsun.ttc")
+            self.fontStyle = ImageFont.truetype(self.font_path, 20, encoding="utf-8") # textsize is 20
+            print("found font path for manderine {0}".format(self.font_path))
+        self.nms_th = rospy.get_param('~nms_th', 0.3)
+
+        # Load publisher topics
+        self.front_detected_objects_topic = rospy.get_param('~front_detected_objects_topic')
+        self.published_front_image_topic = rospy.get_param('~detections_front_image_topic')
+        
+        self.back_detected_objects_topic = rospy.get_param('~back_detected_objects_topic')
+        self.published_back_image_topic = rospy.get_param('~detections_back_image_topic')
+        
+        self.right_detected_objects_topic = rospy.get_param('~right_detected_objects_topic')
+        self.published_right_image_topic = rospy.get_param('~detections_right_image_topic')
+
+        # Load other parameters
+        config_name = rospy.get_param('~config_name', 'yolov3.cfg')
+        self.config_path = os.path.join(package_path, 'config', config_name)
+        classes_name = rospy.get_param('~classes_name', 'coco.names')
+        self.classes_path = os.path.join(package_path, 'classes', classes_name)
+        self.gpu_id = rospy.get_param('~gpu_id', 0)
+        self.network_img_size = rospy.get_param('~img_size', 416)
+        self.publish_image = rospy.get_param('~publish_image')
+
+        # Initialize width and height
+        self.h_front = 0
+        self.w_front = 0
+        
+        self.h_back = 0
+        self.w_back = 0
+        
+        self.h_right = 0
+        self.w_right = 0
+
+        # Load net
+        self.model = Darknet(self.config_path, img_size=self.network_img_size)
+        self.model.load_weights(self.weights_path)
+        if torch.cuda.is_available():
+            self.model.cuda()
+        else:
+            raise IOError('CUDA not found.')
+        self.model.eval() # Set in evaluation mode
+        rospy.loginfo("Deep neural network loaded")
+
+        # Load CvBridge
+        self.bridge = CvBridge()
+
+        # Load classes
+        self.classes = load_classes(self.classes_path) # Extracts class labels from file
+        self.classes_colors = {}
+
+        # Define subscribers
+        self.front_image_sub = rospy.Subscriber(self.front_image_topic, Image, self.imageCb_front, queue_size = 1, buff_size = 2**24)
+
+        self.back_image_sub = rospy.Subscriber(self.back_image_topic, Image, self.imageCb_back, queue_size = 1, buff_size = 2**24)
+        
+        self.right_image_sub = rospy.Subscriber(self.right_image_topic, Image, self.imageCb_right, queue_size = 1, buff_size = 2**24)
+
+        # Define publishers
+        self.front_pub_ = rospy.Publisher(self.front_detected_objects_topic, BoundingBoxes, queue_size=10)
+        self.front_pub_viz_ = rospy.Publisher(self.published_front_image_topic, Image, queue_size=10)
+
+        self.back_pub_ = rospy.Publisher(self.back_detected_objects_topic, BoundingBoxes, queue_size=10)
+        self.back_pub_viz_ = rospy.Publisher(self.published_back_image_topic, Image, queue_size=10)
+        
+        self.right_pub_ = rospy.Publisher(self.right_detected_objects_topic, BoundingBoxes, queue_size=10)
+        self.right_pub_viz_ = rospy.Publisher(self.published_right_image_topic, Image, queue_size=10)
+
+        rospy.loginfo("Launched node for object detection")
+
+        # Spin
+        rospy.spin()
+
+    def imageCb_front(self, data):
+        # Convert the image to OpenCV
+        try:
+            self.cv_image_front = self.bridge.imgmsg_to_cv2(data, "rgb8")
+        except CvBridgeError as e:
+            print(e)
+
+        # Initialize detection results
+        detection_results = BoundingBoxes()
+        detection_results.header = data.header
+        detection_results.image_header = data.header
+
+        # Configure input
+        input_img = self.imagePreProcessing_front(self.cv_image_front)
+        input_img = Variable(input_img.type(torch.cuda.FloatTensor))
+
+        # Get detections from network
+        with torch.no_grad():
+            detections = self.model(input_img)
+            detections = non_max_suppression(detections, 80, self.confidence_th, self.nms_th)
+
+        # Parse detections
+        if detections[0] is not None:
+            for detection in detections[0]:
+                # Get xmin, ymin, xmax, ymax, confidence and class
+                xmin, ymin, xmax, ymax, _, conf, det_class = detection
+                pad_x = max(self.h_front - self.w_front, 0) * (self.network_img_size/max(self.h_front, self.w_front))
+                pad_y = max(self.w_front - self.h_front, 0) * (self.network_img_size/max(self.h_front, self.w_front))
+                unpad_h = self.network_img_size-pad_y
+                unpad_w = self.network_img_size-pad_x
+                xmin_unpad = ((xmin-pad_x//2)/unpad_w)*self.w_front
+                xmax_unpad = ((xmax-xmin)/unpad_w)*self.w_front + xmin_unpad
+                ymin_unpad = ((ymin-pad_y//2)/unpad_h)*self.h_front
+                ymax_unpad = ((ymax-ymin)/unpad_h)*self.h_front + ymin_unpad
+
+                # Populate darknet message
+                detection_msg = BoundingBox()
+                detection_msg.xmin = xmin_unpad
+                detection_msg.xmax = xmax_unpad
+                detection_msg.ymin = ymin_unpad
+                detection_msg.ymax = ymax_unpad
+                detection_msg.probability = conf
+                detection_msg.Class = self.classes[int(det_class)]
+
+                # Append in overall detection message
+                detection_results.bounding_boxes.append(detection_msg)
+
+        # Publish detection results
+        self.front_pub_.publish(detection_results)
+
+        # Visualize detection results
+        if (self.publish_image):
+            self.visualizeAndPublish_front(detection_results, self.cv_image_front)
+        return True
+
+    def imageCb_back(self, data):
+        # Convert the image to OpenCV
+        try:
+            self.cv_image_back = self.bridge.imgmsg_to_cv2(data, "rgb8")
+        except CvBridgeError as e:
+            print(e)
+
+        # Initialize detection results
+        detection_results = BoundingBoxes()
+        detection_results.header = data.header
+        detection_results.image_header = data.header
+
+        # Configure input
+        input_img = self.imagePreProcessing_back(self.cv_image_back)
+        input_img = Variable(input_img.type(torch.cuda.FloatTensor))
+
+        # Get detections from network
+        with torch.no_grad():
+            detections = self.model(input_img)
+            detections = non_max_suppression(detections, 80, self.confidence_th, self.nms_th)
+
+        # Parse detections
+        if detections[0] is not None:
+            for detection in detections[0]:
+                # Get xmin, ymin, xmax, ymax, confidence and class
+                xmin, ymin, xmax, ymax, _, conf, det_class = detection
+                pad_x = max(self.h_back - self.w_back, 0) * (self.network_img_size/max(self.h_back, self.w_back))
+                pad_y = max(self.w_back - self.h_back, 0) * (self.network_img_size/max(self.h_back, self.w_back))
+                unpad_h = self.network_img_size-pad_y
+                unpad_w = self.network_img_size-pad_x
+                xmin_unpad = ((xmin-pad_x//2)/unpad_w)*self.w_back
+                xmax_unpad = ((xmax-xmin)/unpad_w)*self.w_back + xmin_unpad
+                ymin_unpad = ((ymin-pad_y//2)/unpad_h)*self.h_back
+                ymax_unpad = ((ymax-ymin)/unpad_h)*self.h_back + ymin_unpad
+
+                # Populate darknet message
+                detection_msg = BoundingBox()
+                detection_msg.xmin = xmin_unpad
+                detection_msg.xmax = xmax_unpad
+                detection_msg.ymin = ymin_unpad
+                detection_msg.ymax = ymax_unpad
+                detection_msg.probability = conf
+                detection_msg.Class = self.classes[int(det_class)]
+
+                # Append in overall detection message
+                detection_results.bounding_boxes.append(detection_msg)
+
+        # Publish detection results
+        self.back_pub_.publish(detection_results)
+
+        # Visualize detection results
+        if (self.publish_image):
+            self.visualizeAndPublish_back(detection_results, self.cv_image_back)
+        return True
+
+    def imageCb_right(self, data):
+        # Convert the image to OpenCV
+        try:
+            self.cv_image_right = self.bridge.imgmsg_to_cv2(data, "rgb8")
+        except CvBridgeError as e:
+            print(e)
+
+        # Initialize detection results
+        detection_results = BoundingBoxes()
+        detection_results.header = data.header
+        detection_results.image_header = data.header
+
+        # Configure input
+        input_img = self.imagePreProcessing_right(self.cv_image_right)
+        input_img = Variable(input_img.type(torch.cuda.FloatTensor))
+
+        # Get detections from network
+        with torch.no_grad():
+            detections = self.model(input_img)
+            detections = non_max_suppression(detections, 80, self.confidence_th, self.nms_th)
+
+        # Parse detections
+        if detections[0] is not None:
+            for detection in detections[0]:
+                # Get xmin, ymin, xmax, ymax, confidence and class
+                xmin, ymin, xmax, ymax, _, conf, det_class = detection
+                pad_x = max(self.h_right - self.w_right, 0) * (self.network_img_size/max(self.h_right, self.w_right))
+                pad_y = max(self.w_right - self.h_right, 0) * (self.network_img_size/max(self.h_right, self.w_right))
+                unpad_h = self.network_img_size-pad_y
+                unpad_w = self.network_img_size-pad_x
+                xmin_unpad = ((xmin-pad_x//2)/unpad_w)*self.w_right
+                xmax_unpad = ((xmax-xmin)/unpad_w)*self.w_right + xmin_unpad
+                ymin_unpad = ((ymin-pad_y//2)/unpad_h)*self.h_right
+                ymax_unpad = ((ymax-ymin)/unpad_h)*self.h_right + ymin_unpad
+
+                # Populate darknet message
+                detection_msg = BoundingBox()
+                detection_msg.xmin = xmin_unpad
+                detection_msg.xmax = xmax_unpad
+                detection_msg.ymin = ymin_unpad
+                detection_msg.ymax = ymax_unpad
+                detection_msg.probability = conf
+                detection_msg.Class = self.classes[int(det_class)]
+
+                # Append in overall detection message
+                detection_results.bounding_boxes.append(detection_msg)
+
+        # Publish detection results
+        self.right_pub_.publish(detection_results)
+
+        # Visualize detection results
+        if (self.publish_image):
+            self.visualizeAndPublish_right(detection_results, self.cv_image_right)
+        return True
+
+    def imagePreProcessing_front(self, img):
+        # Extract image and shape
+        img = np.copy(img)
+        img = img.astype(float)
+        height, width, channels = img.shape
+
+        if (height != self.h_front) or (width != self.w_front):
+            self.h_front = height
+            self.w_front = width
+
+            # Determine image to be used
+            self.padded_image_front = np.zeros((max(self.h_front,self.w_front), max(self.h_front,self.w_front), channels)).astype(float)
+
+        # Add padding
+        if (self.w_front > self.h_front):
+            self.padded_image_front[(self.w_front-self.h_front)//2 : self.h_front + (self.w_front-self.h_front)//2, :, :] = img
+        else:
+            self.padded_image_front[:, (self.h_front-self.w_front)//2 : self.w_front + (self.h_front-self.w_front)//2, :] = img
+
+        # Resize and normalize
+        input_img = resize(self.padded_image_front, (self.network_img_size, self.network_img_size, 3))/255.
+
+        # Channels-first
+        input_img = np.transpose(input_img, (2, 0, 1))
+
+        # As pytorch tensor
+        input_img = torch.from_numpy(input_img).float()
+        input_img = input_img[None]
+
+        return input_img
+
+    def imagePreProcessing_back(self, img):
+        # Extract image and shape
+        img = np.copy(img)
+        img = img.astype(float)
+        height, width, channels = img.shape
+
+        if (height != self.h_back) or (width != self.w_back):
+            self.h_back = height
+            self.w_back = width
+
+            # Determine image to be used
+            self.padded_image_back = np.zeros((max(self.h_back,self.w_back), max(self.h_back,self.w_back), channels)).astype(float)
+
+        # Add padding
+        if (self.w_back > self.h_back):
+            self.padded_image_back[(self.w_back-self.h_back)//2 : self.h_back + (self.w_back-self.h_back)//2, :, :] = img
+        else:
+            self.padded_image_back[:, (self.h_back-self.w_back)//2 : self.w_back + (self.h_back-self.w_back)//2, :] = img
+
+        # Resize and normalize
+        input_img = resize(self.padded_image_back, (self.network_img_size, self.network_img_size, 3))/255.
+
+        # Channels-first
+        input_img = np.transpose(input_img, (2, 0, 1))
+
+        # As pytorch tensor
+        input_img = torch.from_numpy(input_img).float()
+        input_img = input_img[None]
+
+        return input_img
+
+
+    def imagePreProcessing_right(self, img):
+        # Extract image and shape
+        img = np.copy(img)
+        img = img.astype(float)
+        height, width, channels = img.shape
+
+        if (height != self.h_right) or (width != self.w_right):
+            self.h_right = height
+            self.w_right = width
+
+            # Determine image to be used
+            self.padded_image_right = np.zeros((max(self.h_right,self.w_right), max(self.h_right,self.w_right), channels)).astype(float)
+
+        # Add padding
+        if (self.w_right > self.h_right):
+            self.padded_image_right[(self.w_right-self.h_right)//2 : self.h_right + (self.w_right-self.h_right)//2, :, :] = img
+        else:
+            self.padded_image_right[:, (self.h_right-self.w_right)//2 : self.w_right + (self.h_right-self.w_right)//2, :] = img
+
+        # Resize and normalize
+        input_img = resize(self.padded_image_right, (self.network_img_size, self.network_img_size, 3))/255.
+
+        # Channels-first
+        input_img = np.transpose(input_img, (2, 0, 1))
+
+        # As pytorch tensor
+        input_img = torch.from_numpy(input_img).float()
+        input_img = input_img[None]
+
+        return input_img
+
+    def visualizeAndPublish_front(self, output, imgIn):
+        # Copy image and visualize
+        imgOut = imgIn.copy()
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        fontScale = 0.8
+        thickness = 2
+        for index in range(len(output.bounding_boxes)):
+            label = output.bounding_boxes[index].Class
+            x_p1 = output.bounding_boxes[index].xmin
+            y_p1 = output.bounding_boxes[index].ymin
+            x_p3 = output.bounding_boxes[index].xmax
+            y_p3 = output.bounding_boxes[index].ymax
+            confidence = output.bounding_boxes[index].probability
+
+            # Find class color
+            if label in self.classes_colors.keys():
+                color = self.classes_colors[label]
+            else:
+                # Generate a new color if first time seen this label
+                color = np.random.randint(0,255,3)
+                self.classes_colors[label] = color
+
+            # Create rectangle
+            # pdb.set_trace()
+            cv2.rectangle(imgOut, (int(x_p1), int(y_p1)), (int(x_p3), int(y_p3)), (int(color[0]),int(color[1]),int(color[2])),thickness)
+            text = ('{:s}: {:.3f}').format(label,confidence)
+            if self.class_names_cn:
+                if (isinstance(imgOut, np.ndarray)):
+                    imgOut = PILImage.fromarray(cv2.cvtColor(imgOut,cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(imgOut)
+                # support manderine
+                draw.text((int(x_p1), int(y_p1+10)), text, textColor=(255, 255, 255), font=self.fontStyle)
+                # convert to opencv
+                imgOut = cv2.cvtColor(np.asarray(imgOut), cv2.COLOR_RGB2BGR)
+            else:
+                cv2.putText(imgOut, text, (int(x_p1), int(y_p1+20)), font, fontScale, (255,255,255), thickness ,cv2.LINE_AA)
+
+        # Publish visualization image
+        image_msg = self.bridge.cv2_to_imgmsg(imgOut, "rgb8")
+        self.front_pub_viz_.publish(image_msg)
+
+    def visualizeAndPublish_back(self, output, imgIn):
+        # Copy image and visualize
+        imgOut = imgIn.copy()
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        fontScale = 0.8
+        thickness = 2
+        for index in range(len(output.bounding_boxes)):
+            label = output.bounding_boxes[index].Class
+            x_p1 = output.bounding_boxes[index].xmin
+            y_p1 = output.bounding_boxes[index].ymin
+            x_p3 = output.bounding_boxes[index].xmax
+            y_p3 = output.bounding_boxes[index].ymax
+            confidence = output.bounding_boxes[index].probability
+
+            # Find class color
+            if label in self.classes_colors.keys():
+                color = self.classes_colors[label]
+            else:
+                # Generate a new color if first time seen this label
+                color = np.random.randint(0,255,3)
+                self.classes_colors[label] = color
+
+            # Create rectangle
+            # pdb.set_trace()
+            cv2.rectangle(imgOut, (int(x_p1), int(y_p1)), (int(x_p3), int(y_p3)), (int(color[0]),int(color[1]),int(color[2])),thickness)
+            text = ('{:s}: {:.3f}').format(label,confidence)
+            if self.class_names_cn:
+                if (isinstance(imgOut, np.ndarray)):
+                    imgOut = PILImage.fromarray(cv2.cvtColor(imgOut,cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(imgOut)
+                # support manderine
+                draw.text((int(x_p1), int(y_p1+10)), text, textColor=(255, 255, 255), font=self.fontStyle)
+                # convert to opencv
+                imgOut = cv2.cvtColor(np.asarray(imgOut), cv2.COLOR_RGB2BGR)
+            else:
+                cv2.putText(imgOut, text, (int(x_p1), int(y_p1+20)), font, fontScale, (255,255,255), thickness ,cv2.LINE_AA)
+
+        # Publish visualization image
+        image_msg = self.bridge.cv2_to_imgmsg(imgOut, "rgb8")
+        self.back_pub_viz_.publish(image_msg)
+
+    def visualizeAndPublish_right(self, output, imgIn):
+        # Copy image and visualize
+        imgOut = imgIn.copy()
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        fontScale = 0.8
+        thickness = 2
+        for index in range(len(output.bounding_boxes)):
+            label = output.bounding_boxes[index].Class
+            x_p1 = output.bounding_boxes[index].xmin
+            y_p1 = output.bounding_boxes[index].ymin
+            x_p3 = output.bounding_boxes[index].xmax
+            y_p3 = output.bounding_boxes[index].ymax
+            confidence = output.bounding_boxes[index].probability
+
+            # Find class color
+            if label in self.classes_colors.keys():
+                color = self.classes_colors[label]
+            else:
+                # Generate a new color if first time seen this label
+                color = np.random.randint(0,255,3)
+                self.classes_colors[label] = color
+
+            # Create rectangle
+            # pdb.set_trace()
+            cv2.rectangle(imgOut, (int(x_p1), int(y_p1)), (int(x_p3), int(y_p3)), (int(color[0]),int(color[1]),int(color[2])),thickness)
+            text = ('{:s}: {:.3f}').format(label,confidence)
+            if self.class_names_cn:
+                if (isinstance(imgOut, np.ndarray)):
+                    imgOut = PILImage.fromarray(cv2.cvtColor(imgOut,cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(imgOut)
+                # support manderine
+                draw.text((int(x_p1), int(y_p1+10)), text, textColor=(255, 255, 255), font=self.fontStyle)
+                # convert to opencv
+                imgOut = cv2.cvtColor(np.asarray(imgOut), cv2.COLOR_RGB2BGR)
+            else:
+                cv2.putText(imgOut, text, (int(x_p1), int(y_p1+20)), font, fontScale, (255,255,255), thickness ,cv2.LINE_AA)
+
+        # Publish visualization image
+        image_msg = self.bridge.cv2_to_imgmsg(imgOut, "rgb8")
+        self.right_pub_viz_.publish(image_msg)
+
+
+if __name__=="__main__":
+    # Initialize node
+    rospy.init_node("detector_manager_node")
+
+    # Define detector object
+    dm = DetectorManager()

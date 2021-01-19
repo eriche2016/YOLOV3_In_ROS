@@ -29,6 +29,9 @@ ros_cv2_path = '/opt/ros/kinetic/lib/python2.7/dist-packages'
 if ros_cv2_path in sys.path:
     sys.path.remove(ros_cv2_path)
 import cv2
+import pdb
+# pdb.set_trace()
+
 from cv_bridge import CvBridge, CvBridgeError
 
 package = RosPack()
@@ -42,8 +45,6 @@ from torch.autograd import Variable
 
 from models import *
 from utils.utils import *
-
-import pdb
 
 # Detector manager class for YOLO
 class DetectorManager():
@@ -62,11 +63,11 @@ class DetectorManager():
         self.image_topic = rospy.get_param('~image_topic', '/camera/rgb/image_raw')
         self.confidence_th = rospy.get_param('~confidence', 0.7)
         self.class_names_cn = rospy.get_param('~class_names_cn', False)
-        if self.class_names_cn: 
+        if self.class_names_cn:
             # set the font path for mandering output in classn names
             self.font_path = os.path.join(package_path, 'fonts', "simsun.ttc")
             self.fontStyle = ImageFont.truetype(self.font_path, 20, encoding="utf-8") # textsize is 20
-            print("found font path for manderine {0}".format(self.font_path))  
+            print("found font path for manderine {0}".format(self.font_path))
         self.nms_th = rospy.get_param('~nms_th', 0.3)
 
         # Load publisher topics

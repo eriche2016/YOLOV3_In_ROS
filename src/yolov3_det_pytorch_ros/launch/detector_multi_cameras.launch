@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+    <!--static transform from rs16 to rs32-->
+    <node pkg="tf" type="static_transform_publisher" name="rs16_to_rs32_broadcaster" args="0.737 0.1325 5.805 0.0328 -0.705 0.708 0.0117 rs16 rs32 100"/>
+    
+    <!-- Camera topic and weights, config and classes files -->
+    <arg name="ros_bag_file"	                default="/home/ps/hxw_projects/OpenPCDet_working/catkin_ws/src/hf3d_ros/bag/indoor1.bag"/>
+
+    <node pkg="rosbag" type="play" name="player" output="log" args="-l $(arg ros_bag_file)" />
+
+    <!-- Camera topics and weights, config and classes files, currently there are 3 camera in the system -->
+    <arg name="front_image_topic"	                default="/camera_node/image_raw"/>
+    <arg name="back_image_topic"	                default="/camera1/usb_cam1/image_raw"/>
+    <arg name="right_image_topic"	                default="/camera2/usb_cam2/image_raw"/>
+    <arg name="weights_name"	            default="yolov3.weights"/>
+    <arg name="config_name"	                default="yolov3.cfg"/>
+    <arg name="classes_name"	            default="coco.names"/>
+
+    <!-- Published topics -->
+    <arg name="publish_image"	            default="true"/>
+    <arg name="front_detected_objects_topic"      default="detected_objects_in_front_image"/>
+    <arg name="detections_front_image_topic"      default="detections_front_image_topic"/>
+    <arg name="back_detected_objects_topic"      default="detected_objects_in_back_image"/>
+    <arg name="detections_back_image_topic"      default="detections_back_image_topic"/>
+    <arg name="right_detected_objects_topic"      default="detected_objects_in_right_image"/>
+    <arg name="detections_right_image_topic"      default="detections_right_image_topic"/>
+
+    <!-- Detection confidence -->
+    <arg name="confidence"                  default="0.7"/>
+    <arg name="class_names_cn"	            default="false"/>
+
+    <!-- Node -->
+    <node name="detector_manager" pkg="yolov3_pytorch_ros" type="detector_multi_cameras.py" output="screen" respawn="true">
+        <param name="front_image_topic"               value="$(arg front_image_topic)"/>
+        <param name="back_image_topic"               value="$(arg back_image_topic)"/>
+        <param name="right_image_topic"               value="$(arg right_image_topic)"/>
+        <param name="weights_name"              value="$(arg weights_name)"/>
+        <param name="config_name"               value="$(arg config_name)"/>
+        <param name="classes_name"              value="$(arg classes_name)"/>
+        <param name="publish_image"             value="$(arg publish_image)"/>
+        <param name="front_detected_objects_topic"    value="$(arg front_detected_objects_topic)"/>
+        <param name="detections_front_image_topic"    value="$(arg detections_front_image_topic)"/>
+        <param name="back_detected_objects_topic"    value="$(arg back_detected_objects_topic)"/>
+        <param name="detections_back_image_topic"    value="$(arg detections_back_image_topic)"/>
+        <param name="right_detected_objects_topic"    value="$(arg right_detected_objects_topic)"/>
+        <param name="detections_right_image_topic"    value="$(arg detections_right_image_topic)"/>
+        <param name="confidence"                value="$(arg confidence)"/>
+        <param name="class_names_cn"             value="$(arg class_names_cn)"/>
+    </node>
+    <node type="rviz" name="rviz" pkg="rviz"/>
+</launch>
