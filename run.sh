@@ -36,11 +36,16 @@ if [ 1 -eq 1 ]; then
     roslaunch yolov3_pytorch_ros detector_multi_cameras.launch ros_bag_file:="/media/ps/data/HF3D_Obj_Det/raw_data/hf_indoors_cameras3_lidars2_frame_id_rs16_rs32.bag" classes_name:="coco_cn.names" class_names_cn:=True  
 fi
 
-
-
 if [ 1 -eq 0 ]; then 
     # launch usb camera dirver in ROS
     # roslaunch usb_cam usb_cam-test.launch
     # detect it 
     CUDA_VISIBLE_DEVICES="1" roslaunch yolov3_pytorch_ros detector_from_camera.launch classes_name:="coco_cn.names" class_names_cn:=True  
 fi 
+
+################################################################################################
+## Read point cloud from rs16, using tf to convert it to rs32 coordinate frme, finally publish the results 
+################################################################################################
+if [ 1 -eq 0 ]; then 
+    CUDA_VISIBLE_DEVICES="1" roslaunch yolov3_pytorch_ros pc_rs16_to_rs32_tf.launch ros_bag_file:="/media/ps/data/HF3D_Obj_Det/raw_data/hf_indoors_cameras3_lidars2_frame_id_rs16_rs32.bag" 
+fi  

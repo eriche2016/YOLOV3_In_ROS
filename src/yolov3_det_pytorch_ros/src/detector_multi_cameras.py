@@ -207,7 +207,7 @@ class DetectorManager():
         detection_results.header = data.header
         detection_results.image_header = data.header
 
-        # Configure input
+        # Configure Input
         input_img = self.imagePreProcessing_back(self.cv_image_back)
         input_img = Variable(input_img.type(torch.cuda.FloatTensor))
 
